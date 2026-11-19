@@ -13,6 +13,22 @@
 
 **TG WS Proxy Android** — это локальный **MTProto-прокси** для Telegram на Android. Приложение помогает частично решать проблемы и в ряде сценариев ускоряет работу мессенджера, перенаправляя трафик через защищённые CloudFlare WebSocket-соединения или напрямую к датацентрам Telegram.
 
+> [!IMPORTANT]
+> ### ⚠️ Это неофициальная сборка
+>
+> Последний официальный релиз — **v1.2.3** (17.06.2026). В нём **нет** коммита
+> [`7c7f168`](https://github.com/amurcanov/tg-ws-proxy-android/commit/7c7f168)
+> «Fixed proxy operation on mobile networks», поэтому на мобильных сетях с DPI
+> (LTE/5G, где режется TLS SNI к `kws*.…` на порту 443) прокси молча не подключается.
+>
+> В этой сборке CloudFlare-маршрут работает по **порту 80** (`DISABLE_SECURE = true`),
+> что на таких сетях проходит. Код взят из `main` (540e588), собран как **v1.2.4**.
+>
+> - **Скачать:** [Releases](../../releases)
+> - Подпись — собственный ключ, поэтому установить **поверх** официального v1.2.3 нельзя:
+>   нужно удалить старое приложение (настройки и секрет сбросятся).
+> - Это не релиз amurcanov. Вопросы по этой сборке — в issues этого форка, не в upstream.
+
 ---
 
 <img width="972" height="696" alt="MyCollages (5)" src="https://github.com/user-attachments/assets/7c9b9f2a-fc60-4aee-b93d-db950e24555c" />
@@ -74,6 +90,61 @@ Telegram Android → Локальный MTProto (по умолчанию 127.0.0
 > Приложение адаптировано под мобильные сети, однако проблемы с фоновой работой всё ещё возможны из-за системных ограничений или сети.
 >
 > Если у вас возникла проблема, сбой или вопрос, пожалуйста, нажмите кнопку **«Собрать отчёт»** внутри приложения и приложите полученные данные к вашему `issue`. Мелкие ошибки в логах при нормально работающем прокси можно игнорировать.
+
+---
+
+## Сборка
+
+Требования: JDK 17+ (нужен `javac`, одного JRE недостаточно) и Android SDK.
+
+```bash
+./gradlew assembleArm64Debug      # debug
+./gradlew assembleArm64Release    # release (нужен keystore, см. ниже)
+```
+
+Варианты: `arm64` (minSdk 24), `arm32` (minSdk 21), `universal` (обе ABI).
+Готовые APK — в `app/build/outputs/apk/<flavor>/<buildType>/`.
+
+### Подпись release
+
+Параметры читаются из `local.properties` (файл в git не попадает):
+
+```properties
+sdk.dir=/opt/android-sdk
+KEYSTORE_FILE=/absolute/path/release.keystore
+KEYSTORE_PASSWORD=...
+KEY_ALIAS=...
+KEY_PASSWORD=...
+```
+
+Создать ключ:
+
+```bash
+keytool -genkeypair -keystore release.keystore -alias tgws \
+  -keyalg RSA -keysize 4096 -validity 10000
+```
+
+Без keystore release-APK соберётся неподписанным.
+
+### Сборка на ARM-хосте (Android-chroot, qemu-user)
+
+В этом форке Gradle и AGP понижены до **8.11.1 / 8.9.2**:
+
+- Gradle 9.x в chroot падает с `java.io.IOException: Mount point not found`
+  (`Files.getFileStore`), а AGP 9 требует именно Gradle 9;
+- явно подключён плагин `org.jetbrains.kotlin.android` — AGP 8.x не подключает Kotlin сам
+  (иначе в APK не попадают Kotlin-классы, в том числе `ProxyService`).
+
+`aapt2`, который скачивает AGP, существует только под `linux-x86_64`, поэтому на arm64
+он запускается через qemu:
+
+```bash
+./gradlew assembleArm64Release \
+  -Pandroid.aapt2FromMavenOverride="$(pwd)/tools/aapt2-qemu.sh"
+```
+
+`tools/aapt2-qemu.sh` находит aapt2 в кэше Gradle и вызывает `qemu-x86_64-static`.
+При необходимости так же оборачиваются `zipalign`, `aidl` и `aapt` из `build-tools`.
 
 ---
 
