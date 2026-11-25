@@ -7,6 +7,8 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -32,6 +34,15 @@ class ProxyService : Service() {
     @Volatile
     private var stopInProgress = false
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    // Watchdog: смена сети и «залипший» движок (сокеты умерли, трафик не идёт).
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    @Volatile private var lastNetworkHandle: Long = 0L
+    private var lastRestartAtMs: Long = 0L
+    private var stallBytes: Double = -1.0
+    private var stallSinceMs: Long = 0L
+    private var stallTotal: Long = -1L
+    private var stallErr: Long = -1L
 
     // Saved intent extras for restart on kill / onTaskRemoved
     private var lastBindIp: String = "127.0.0.1"
@@ -68,6 +79,11 @@ class ProxyService : Service() {
         private const val STATS_UPDATE_MS = 3_000L
         private const val NOTIFICATION_MIN_UPDATE_MS = 3_000L
         private const val NATIVE_STOP_WAIT_MS = 3_000L
+
+        // Watchdog
+        private const val STALL_RESTART_MS = 4L * 60 * 1000
+        private const val NETWORK_RESTART_DEBOUNCE_MS = 5_000L
+        private const val RESTART_MIN_INTERVAL_MS = 60_000L
 
         private val _isRunning = MutableStateFlow(false)
         val isRunning: StateFlow<Boolean> = _isRunning
@@ -182,6 +198,7 @@ class ProxyService : Service() {
                 NativeProxy.setCfProxyConfig(cfEnabled, cfPriority, cfDomain)
                 val result = NativeProxy.startProxy(bindIp, port, ips, secretKey, 1)
                 if (result == 0) {
+                    registerNetworkMonitor()
                     serviceScope.launch {
                         if (!stopInProgress) {
                             updateRunningState(true)
@@ -234,6 +251,37 @@ class ProxyService : Service() {
                         
                         val totalBytes = parseHumanBytes(upRaw) + parseHumanBytes(downRaw)
                         val active = activeConns.toIntOrNull() ?: 0
+
+                        // Watchdog: байты не растут. Перезапускаем только когда это
+                        // действительно простой (экран включён) или клиент продолжает
+                        // стучаться/ошибаться — иначе ночью в простое будет thrash.
+                        val totalConns = extractStat(rawStats, "total=").toLongOrNull() ?: 0L
+                        val errCount = extractStat(rawStats, "err=").toLongOrNull() ?: 0L
+                        val nowMs = System.currentTimeMillis()
+                        when {
+                            active <= 0 || totalBytes < stallBytes -> {
+                                stallBytes = totalBytes
+                                stallSinceMs = nowMs
+                                stallTotal = totalConns
+                                stallErr = errCount
+                            }
+                            totalBytes > stallBytes -> {
+                                stallBytes = totalBytes
+                                stallSinceMs = nowMs
+                                stallTotal = totalConns
+                                stallErr = errCount
+                            }
+                            stallSinceMs > 0L &&
+                                nowMs - stallSinceMs >= STALL_RESTART_MS &&
+                                (isScreenOn() || totalConns > stallTotal || errCount > stallErr) -> {
+                                Log.w(TAG, "Watchdog: stalled ${(nowMs - stallSinceMs) / 1000}s (active=$active, conns=$totalConns, err=$errCount), restarting")
+                                stallSinceMs = nowMs
+                                stallTotal = totalConns
+                                stallErr = errCount
+                                scheduleWatchdogRestart("stall")
+                            }
+                        }
+
                         val text = getString(R.string.notification_traffic, formatBytes(totalBytes), active)
                         updateNotification(text)
                     } catch (e: Exception) {
@@ -258,6 +306,60 @@ class ProxyService : Service() {
             manager?.notify(NOTIFICATION_ID, createNotification(content))
         } catch (e: Exception) {
             Log.w(TAG, "Failed to update notification", e)
+        }
+    }
+
+    private fun registerNetworkMonitor() {
+        if (networkCallback != null) return
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                val handle = network.networkHandle
+                val previous = lastNetworkHandle
+                lastNetworkHandle = handle
+                if (previous != 0L && previous != handle) {
+                    Log.i(TAG, "Watchdog: default network changed $previous -> $handle")
+                    scheduleWatchdogRestart("network-change")
+                }
+            }
+        }
+        try {
+            cm.registerDefaultNetworkCallback(cb)
+            networkCallback = cb
+            lastNetworkHandle = cm.activeNetwork?.networkHandle ?: 0L
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to register network monitor", e)
+        }
+    }
+
+    private fun unregisterNetworkMonitor() {
+        val cb = networkCallback ?: return
+        networkCallback = null
+        try {
+            (getSystemService(ConnectivityManager::class.java))?.unregisterNetworkCallback(cb)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun isScreenOn(): Boolean {
+        return try {
+            (getSystemService(PowerManager::class.java))?.isInteractive ?: true
+        } catch (_: Exception) {
+            true
+        }
+    }
+
+    private fun scheduleWatchdogRestart(reason: String) {
+        val nowMs = System.currentTimeMillis()
+        if (nowMs - lastRestartAtMs < RESTART_MIN_INTERVAL_MS) return
+        if (restartJob?.isActive == true) return
+        lastRestartAtMs = nowMs
+        serviceScope.launch {
+            delay(NETWORK_RESTART_DEBOUNCE_MS.milliseconds)
+            if (_isRunning.value && !stopInProgress) {
+                Log.w(TAG, "Watchdog: restarting proxy ($reason)")
+                restartProxy()
+            }
         }
     }
 
@@ -322,6 +424,7 @@ class ProxyService : Service() {
     private fun stopProxy() {
         if (stopInProgress) return
         stopInProgress = true
+        unregisterNetworkMonitor()
         restartJob?.cancel()
         restartJob = null
         statsJob?.cancel()
@@ -501,6 +604,7 @@ class ProxyService : Service() {
     }
 
     override fun onDestroy() {
+        unregisterNetworkMonitor()
         restartJob?.cancel()
         restartJob = null
         statsJob?.cancel()

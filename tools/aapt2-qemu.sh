@@ -14,8 +14,26 @@ set -eu
 if [ -n "${AAPT2_REAL:-}" ]; then
     REAL="$AAPT2_REAL"
 else
-    CACHE="${GRADLE_USER_HOME:-$HOME/.gradle}/caches"
-    REAL="$(find "$CACHE" -type f -path '*transformed/aapt2-*-linux/aapt2' 2>/dev/null | head -n 1)"
+    # Распаковать из jar-артефакта в кэше Gradle (linux-классификатор, x86-64).
+    JAR="$(find "${GRADLE_USER_HOME:-$HOME/.gradle}" /root/gradle-home -type f -name 'aapt2-*-linux.jar' 2>/dev/null | head -n 1)"
+    if [ -n "$JAR" ]; then
+        CACHE_BIN="/tmp/opencode/aapt2-cache"
+        mkdir -p "$CACHE_BIN"
+        if [ ! -x "$CACHE_BIN/aapt2" ]; then
+            unzip -o -q "$JAR" aapt2 -d "$CACHE_BIN" 2>/dev/null || true
+            chmod +x "$CACHE_BIN/aapt2" 2>/dev/null || true
+        fi
+        [ -x "$CACHE_BIN/aapt2" ] && REAL="$CACHE_BIN/aapt2"
+    fi
+    if [ -z "$REAL" ]; then
+    REAL=""
+    for cache in "${GRADLE_USER_HOME:-}" "$HOME/.gradle" /root/gradle-home; do
+        [ -n "$cache" ] || continue
+        [ -d "$cache/caches" ] || continue
+        REAL="$(find "$cache/caches" -type f -path '*transformed/aapt2-*-linux/aapt2' 2>/dev/null | head -n 1)"
+        [ -n "$REAL" ] && break
+    done
+    fi
 fi
 
 if [ -z "${REAL:-}" ] || [ ! -x "$REAL" ]; then
